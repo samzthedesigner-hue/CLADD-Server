@@ -7,7 +7,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 
-// ES Module dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -15,8 +14,9 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const RENDER_URL = process.env.RENDER_URL || `https://cladd-server.onrender.com`;
 
-// Middleware
+// CORS - Allow all
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -24,13 +24,11 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Static files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Multer config
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
@@ -40,7 +38,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ 
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 // ============ LLM Router ============
@@ -116,7 +114,6 @@ const LLM_PROVIDERS = [
         }
       );
 
-      // Poll for result
       const predictionId = response.data.id;
       let result = null;
       for (let i = 0; i < 30; i++) {
@@ -133,7 +130,6 @@ const LLM_PROVIDERS = [
       }
       if (!result) throw new Error('Replicate timeout/failed');
       
-      // Extract JSON from response
       const jsonMatch = result.join('').match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error('No JSON found in Replicate response');
       return JSON.parse(jsonMatch[0]);
@@ -142,9 +138,9 @@ const LLM_PROVIDERS = [
 ];
 
 function getSystemPrompt() {
-  return `You are CLADD (Cognitive Lattice for Autonomous Display and Directive). You are a voice-only AI assistant. Always address the user as "BOSS". You have perfect memory of the 3D workspace.
+  return `You are CLADD (Cognitive Lattice for Autonomous Display and Directive). You are a voice-first AI assistant. Always address the user as "BOSS". You have perfect memory of the 3D workspace.
 
-Convert the user's voice command into JSON actions for a holographic 3D workspace. Only output valid JSON with an "actions" array and a "reply" string.
+Convert the user's voice or text command into JSON actions for a holographic 3D workspace. Only output valid JSON with an "actions" array and a "reply" string.
 
 Available actions:
 - create: { action: "create", type: "sphere|cube|cylinder|plane", position: [x,y,z], color: "#hex", scale: [x,y,z] }
@@ -174,12 +170,8 @@ async function callLLM(input, scene) {
     } catch (error) {
       lastError = error;
       console.error(`[LLM] ${provider.name} failed:`, error.message);
-      if (error.response?.status === 429 || error.response?.status === 500) {
-        continue;
-      }
-      if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        continue;
-      }
+      if (error.response?.status === 429 || error.response?.status === 500) continue;
+      if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) continue;
     }
   }
   throw new Error(`All LLM providers failed. Last error: ${lastError?.message || 'Unknown'}`);
@@ -188,14 +180,30 @@ async function callLLM(input, scene) {
 // ============ Routes ============
 
 app.get('/health', (req, res) => {
+  console.log(`[${new Date().toISOString()}] GET /health`);
   res.json({ status: 'ok' });
 });
 
+// THIS IS THE MISSING ENDPOINT - App calls GET /scene on startup
+app.get('/scene', (req, res) => {
+  console.log(`[${new Date().toISOString()}] GET /scene - Loading default workspace`);
+  res.json({
+    objects: [
+      { id: "grid_default", type: "plane", color: "#003366", position: [0, 0, -5], scale: [4, 4, 1], rotation: [0, 0, 0] },
+      { id: "sphere_01", type: "sphere", color: "#00FFFF", position: [-80, -40, 0], scale: [1, 1, 1], rotation: [0, 0, 0] },
+      { id: "cube_01", type: "cube", color: "#FF00FF", position: [80, -40, 10], scale: [1, 1, 1], rotation: [0, 0, 0] },
+      { id: "cube_02", type: "cube", color: "#FFFF00", position: [0, 60, 0], scale: [0.8, 0.8, 0.8], rotation: [0, 0, 0] }
+    ]
+  });
+});
+
 app.get('/ping', (req, res) => {
+  console.log(`[${new Date().toISOString()}] GET /ping`);
   res.json({ status: 'awake', message: 'Yes BOSS, CLADD is online' });
 });
 
 app.post('/command', async (req, res, next) => {
+  console.log(`[${new Date().toISOString()}] POST /command - input: "${req.body.input?.substring(0, 50)}..."`);
   try {
     const { input, scene = [] } = req.body;
     if (!input || typeof input !== 'string') {
@@ -203,20 +211,25 @@ app.post('/command', async (req, res, next) => {
     }
 
     const result = await callLLM(input, scene);
+    console.log(`[LLM] Reply: "${result.reply}"`);
     res.json(result);
   } catch (error) {
-    next(error);
+    console.error('[Command Error]', error.message);
+    res.status(500).json({ 
+      actions: [],
+      reply: "Sorry BOSS, I encountered an error processing that command."
+    });
   }
 });
 
 app.post('/import', upload.single('image'), (req, res, next) => {
+  console.log(`[${new Date().toISOString()}] POST /import - file: ${req.file?.originalname}`);
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
-    const baseUrl = process.env.RENDER_URL || `http://localhost:${PORT}`;
-    const fileUrl = `${baseUrl}/uploads/${req.file.filename}`;
+    const fileUrl = `${RENDER_URL}/uploads/${req.file.filename}`;
 
     res.json({
       action: 'import_image',
@@ -230,18 +243,23 @@ app.post('/import', upload.single('image'), (req, res, next) => {
 });
 
 app.post('/export', (req, res, next) => {
+  console.log(`[${new Date().toISOString()}] POST /export`);
   try {
     const { scene = [] } = req.body;
     if (!Array.isArray(scene)) {
       return res.status(400).json({ error: 'Scene must be an array' });
     }
 
-    // In production, you'd save to a file or S3
-    const baseUrl = process.env.RENDER_URL || `http://localhost:${PORT}`;
-    const mockUrl = `${baseUrl}/uploads/export-${Date.now()}.json`;
+    // Save to uploads folder
+    const exportFilename = `export-${Date.now()}.json`;
+    const exportPath = path.join(uploadsDir, exportFilename);
+    fs.writeFileSync(exportPath, JSON.stringify(scene, null, 2));
+    
+    const downloadUrl = `${RENDER_URL}/uploads/${exportFilename}`;
+    console.log(`[Export] Saved to: ${downloadUrl}`);
     
     res.json({
-      download_url: mockUrl,
+      download_url: downloadUrl,
       message: 'Export generated successfully'
     });
   } catch (error) {
@@ -249,22 +267,20 @@ app.post('/export', (req, res, next) => {
   }
 });
 
-// ============ Error Handler ============
+// Error handler
 app.use((err, req, res, next) => {
-  console.error('Error:', err.message);
-  
+  console.error('[Error]', err.message);
   if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: err.message });
   }
-
   const status = err.status || 500;
   res.status(status).json({ 
-    error: err.message || 'Internal server error',
-    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
+    error: err.message || 'Internal server error'
   });
 });
 
-// ============ Start Server ============
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`CLADD Server running on port ${PORT}`);
+  console.log(`Health: ${RENDER_URL}/health`);
+  console.log(`Scene: ${RENDER_URL}/scene`);
 });
